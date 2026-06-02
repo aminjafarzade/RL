@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-dllm"
+version = "0.1.0"
+description = "Source code for the paper 'Learning Unmasking Policies for Diffusion Language Models' by M. Jazbec et al."
+requires-python = "==3.12.*"
+dependencies = [
+  "setuptools>=61.0",
+  "torch",
+  "torchvision",
+  "torchaudio",
+  "transformers==4.53.0",
+  "accelerate==1.4.0",
+  "peft==0.15.1",
+  "trl==0.19.1",
+  "deepspeed==0.16.4",
+  "datasets==4.0.0",
+  "tiktoken==0.9.0",
+  "wandb>=0.16.0",
+  "sentencepiece",
+  "evaluate",
+  "scipy",
+  "tqdm",
+  "regex",
+  "scikit-learn",
+  "python-dotenv",
+  "numpy>=1.26.0",
+  "pandas",
+  "s3fs",
+  "matplotlib",
+  "bitsandbytes==0.45.3; platform_system != 'Darwin'",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["train*", "eval*", "common*", "data*"]
