@@ -1,0 +1,118 @@
+#
+# For licensing see accompanying LICENSE file.
+# Copyright (C) 2026 Apple Inc. All Rights Reserved.
+#
+### Reward/gradient sanity config.
+###
+### This is not a final budget-controlled experiment. It deliberately uses
+### larger sanity budgets, a softer compute penalty, and no hard stop at the
+### target budget so early-policy generations can reach GSM8K final answers.
+### Use this first to verify positive rewards and nonzero GRPO advantages.
+
+# ModelConfig
+torch_dtype: bfloat16
+load_in_4bit: false
+model_path: GSAI-ML/LLaDA-8B-Instruct
+attn_implementation: sdpa
+
+# GRPOConfig
+dataset: gsm8k
+max_train_samples: 64
+max_eval_samples: 32
+seed: 123
+bf16: false
+report_to: none
+
+adam_beta1: 0.9
+adam_beta2: 0.99
+weight_decay: 0.1
+max_grad_norm: 0.2
+
+use_vllm: false
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.9
+
+warmup_steps: 20
+logging_steps: 1
+learning_rate: 3e-5
+lr_scheduler_type: cosine
+
+reward_functions:
+  - mixed_multiplicative_budget_reward_func
+reward_weights:
+  - 1.0
+
+reward_type: multiplicative_budget
+reward_gsm_extractor: robust
+reward_lambda_compute: 0.01
+reward_normalize_compute: true
+reward_beta: 1.0
+reward_mu: 0.1
+reward_rho: 0.0
+
+num_generations: 2
+num_train_epochs: 1
+
+eval_strategy: steps
+eval_steps: 25
+per_device_eval_batch_size: 2
+per_device_train_batch_size: 8
+gradient_accumulation_steps: 1
+
+save_steps: 25
+save_strategy: steps
+save_total_limit: 5
+resume_from_checkpoint: false
+
+max_completion_length: 192
+max_prompt_length: 200
+block_length: 32
+generation_batch_size: 8
+remasking: policy
+beta: 0.0
+epsilon: 0.5
+num_iterations: 2
+loglikelihood_dtype: float32
+
+policy_type: dit_confidence
+policy_hidden_dim: 128
+policy_feedforward_dim: 512
+policy_num_heads: 2
+policy_num_blocks: 1
+policy_dropout: 0.0
+policy_time_embed_dim: 128
+policy_full_context: true
+policy_smart_init: -0.5
+confidences_top_p: 1
+
+method: verifier_policy_reward_sanity
+enable_budget_conditioning: true
+target_budget: 96
+target_budgets: [64, 96, 128]
+train_budget_sampling: [64, 96, 128]
+
+# Do not hard-stop at the target for reward sanity. The reward still uses
+# target_budget as the compute target, but generation can continue to 128 NFEs.
+hard_stop_at_target_budget: false
+hard_generation_budget: 128
+
+enable_verifier: true
+verifier_type: math
+verifier_schedule: final_only
+verifier_every_k_steps: 8
+verifier_threshold: 0.7
+
+enable_remasking: false
+remask_strategy: none
+max_remasks_per_sample: 0
+remask_cooldown_steps: 2
+min_steps_before_remask: 0
+remask_answer_span_mode: numeric_only
+remask_penalty: 0.0
+
+log_step_traces: false
+save_generations: true
+save_verifier_results: true
+count_verifier_time: true
+
+output_dir: outputs/llada_verifier_budget_gsm8k_reward_sanity

@@ -7,10 +7,25 @@
 import argparse
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import s3fs
+
+from common.cuda_env import set_cuda_visible_devices_from_argv
+
+
+def _pipeline_config_path(argv: list[str]) -> str | None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("run_paths", nargs="?")
+    parser.add_argument("config_path", nargs="?")
+    args, _ = parser.parse_known_args(argv)
+    return args.config_path
+
+
+set_cuda_visible_devices_from_argv(config_path=_pipeline_config_path(sys.argv[1:]))
+
 import torch
 
 
@@ -28,6 +43,9 @@ class EvalConfig:
     model_path: str
     save_path: str
     n_test: int | None
+    gpu: str | None
+    cuda_visible_devices: str | None
+    cuda_min_memory_gb: float | None
 
 
 def get_s3() -> s3fs.S3FileSystem:
@@ -155,6 +173,12 @@ def run_eval(
             cmd.extend(["--gen_length", str(cfg.gen_length)])
         if cfg.n_test:
             cmd.extend(["--n_test", str(cfg.n_test)])
+        if cfg.cuda_visible_devices:
+            cmd.extend(["--cuda_visible_devices", cfg.cuda_visible_devices])
+        elif cfg.gpu:
+            cmd.extend(["--gpu", cfg.gpu])
+        if cfg.cuda_min_memory_gb is not None:
+            cmd.extend(["--cuda_min_memory_gb", str(cfg.cuda_min_memory_gb)])
 
         print(f"  Eval: {ckpt} seed={seed} temp={temp} {dataset}")
         result = subprocess.run(cmd, cwd=script_dir.parent)
@@ -244,6 +268,29 @@ def main():
     parser.add_argument("--model_path", default="GSAI-ML/LLaDA-8B-Instruct")
     parser.add_argument("--save_path", default="./eval_results")
     parser.add_argument("--n_test", type=int, default=None)
+    parser.add_argument(
+        "--gpu",
+        default=None,
+        help=(
+            "Physical GPU index/list to expose before torch initializes. "
+            "Example: --gpu 2 makes physical GPU 2 visible as cuda:0."
+        ),
+    )
+    parser.add_argument(
+        "--cuda_visible_devices",
+        "--cuda-visible-devices",
+        dest="cuda_visible_devices",
+        default=None,
+        help="Direct CUDA_VISIBLE_DEVICES value, e.g. '2' or '0,1'.",
+    )
+    parser.add_argument(
+        "--cuda_min_memory_gb",
+        "--cuda-min-memory-gb",
+        dest="cuda_min_memory_gb",
+        type=float,
+        default=None,
+        help="Auto-select the smallest GPU with at least this much total memory.",
+    )
     parser.add_argument("--no_aggregate", action="store_true")
     args = parser.parse_args()
 
@@ -274,6 +321,9 @@ def main():
             model_path=args.model_path,
             save_path=args.save_path,
             n_test=args.n_test,
+            gpu=args.gpu,
+            cuda_visible_devices=args.cuda_visible_devices,
+            cuda_min_memory_gb=args.cuda_min_memory_gb,
         )
         try:
             run_names.append(run_pipeline(cfg))

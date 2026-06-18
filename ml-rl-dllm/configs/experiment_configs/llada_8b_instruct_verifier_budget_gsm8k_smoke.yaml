@@ -2,20 +2,24 @@
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2026 Apple Inc. All Rights Reserved.
 #
-### Verifier-aware budget-conditioned GSM8K config.
-### Existing paper configs are left unchanged; use this for the new project path.
+### Smoke/debug verifier-budget GSM8K config.
 
 # ModelConfig
 torch_dtype: bfloat16
 load_in_4bit: false
 model_path: GSAI-ML/LLaDA-8B-Instruct
+# Manual GPU selection. Example: gpu: 2 exposes physical GPU 2 as process cuda:0.
+# gpu: 2
 
 attn_implementation: sdpa
 
 # GRPOConfig
 dataset: gsm8k
+max_train_samples: 128
+max_eval_samples: 32
 seed: 123
 bf16: false
+report_to: none
 
 adam_beta1: 0.9
 adam_beta2: 0.99
@@ -26,7 +30,7 @@ use_vllm: false
 vllm_device: auto
 vllm_gpu_memory_utilization: 0.9
 
-warmup_steps: 100
+warmup_steps: 10
 logging_steps: 1
 learning_rate: 3e-5
 lr_scheduler_type: cosine
@@ -35,11 +39,13 @@ reward_functions:
 reward_weights:
   - 1.0
 
-num_generations: 8
+num_generations: 2
 num_train_epochs: 1
 
-per_device_eval_batch_size: 1
-per_device_train_batch_size: 16
+eval_strategy: steps
+eval_steps: 25
+per_device_eval_batch_size: 2
+per_device_train_batch_size: 8
 gradient_accumulation_steps: 1
 
 gradient_checkpointing: false
@@ -48,15 +54,15 @@ gradient_checkpointing_kwargs:
 
 resume_from_checkpoint: false
 
-save_steps: 100
+save_steps: 25
 save_strategy: steps
-save_total_limit: 500
+save_total_limit: 20
 
 # Diffusion and GRPO-specific
-max_completion_length: 256
+max_completion_length: 96
 max_prompt_length: 200
 block_length: 32
-generation_batch_size: 128
+generation_batch_size: 8
 remasking: policy
 beta: 0.
 epsilon: 0.5
@@ -76,34 +82,36 @@ policy_smart_init: -2.0
 confidences_top_p: 1
 
 # Verifier-aware budget-conditioned decoding
-method: verifier_policy
+method: verifier_policy_smoke
 enable_budget_conditioning: true
-target_budget: 32
-target_budgets: [8, 16, 32, 64, 128]
-train_budget_sampling: [8, 16, 32, 64, 128]
+target_budget: 8
+target_budgets: [4, 8, 16]
+train_budget_sampling: [4, 8, 16]
 
 enable_verifier: true
 verifier_type: math
-verifier_schedule: after_answer_detected
+verifier_schedule: final_only
 verifier_every_k_steps: 8
 verifier_threshold: 0.7
 
-enable_remasking: true
-remask_strategy: verifier_answer
-max_remasks_per_sample: 1
+enable_remasking: false
+remask_strategy: none
+max_remasks_per_sample: 0
 remask_cooldown_steps: 2
 min_steps_before_remask: 0
 remask_answer_span_mode: numeric_only
-remask_penalty: 0.1
+remask_penalty: 0.0
 
 reward_type: multiplicative_budget
 reward_lambda_compute: 0.01
 reward_normalize_compute: true
 reward_beta: 2.0
 reward_mu: 0.5
-reward_rho: 0.1
+reward_rho: 0.0
 
 log_step_traces: false
 save_generations: true
 save_verifier_results: true
 count_verifier_time: true
+
+output_dir: outputs/llada_verifier_budget_gsm8k_smoke

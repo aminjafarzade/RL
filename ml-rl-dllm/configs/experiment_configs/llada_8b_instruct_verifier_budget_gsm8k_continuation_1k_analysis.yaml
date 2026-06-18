@@ -1,0 +1,105 @@
+#
+# For licensing see accompanying LICENSE file.
+# Copyright (C) 2026 Apple Inc. All Rights Reserved.
+#
+### GSM8K post-hoc continuation analysis.
+###
+### This is not an RL fine-tuning run. It collects fixed-policy draft and
+### answer-region continuation records for offline continuation-gate analysis.
+
+# ModelConfig
+torch_dtype: bfloat16
+load_in_4bit: false
+model_path: GSAI-ML/LLaDA-8B-Instruct
+attn_implementation: sdpa
+
+dataset: gsm8k
+max_train_samples: 1000
+max_eval_samples: 128
+seed: 123
+
+# Analysis only. No RL training.
+analysis_only: true
+freeze_policy: true
+do_train: false
+
+num_generations: 1
+
+max_completion_length: 192
+max_prompt_length: 200
+block_length: 32
+generation_batch_size: 8
+remasking: policy
+sampling_mode: bernoulli
+temperature: 0.0
+temperature_policy: 1.0
+dpls_stop_logit: 0.0
+
+policy_type: dit_confidence
+policy_hidden_dim: 128
+policy_feedforward_dim: 512
+policy_num_heads: 2
+policy_num_blocks: 1
+policy_dropout: 0.0
+policy_time_embed_dim: 128
+policy_time_period: 1
+policy_full_context: true
+policy_smart_init: 1.5
+policy_checkpoint_path: null
+confidences_top_p: 1
+
+enable_budget_conditioning: true
+target_budget: 32
+target_budgets: [24, 32, 40]
+train_budget_sampling: [24, 32, 40]
+hard_stop_at_target_budget: false
+hard_generation_budget: 48
+
+reward_type: multiplicative_budget
+reward_gsm_extractor: answer_span
+reward_quality_mode: format_weighted
+answer_span_partial_credit: 0.45
+malformed_answer_factor: 0.5
+enable_repetition_penalty: true
+repetition_unique_ratio_threshold: 0.25
+repetition_max_freq_threshold: 0.25
+repetition_penalty_factor: 0.5
+max_reward_if_malformed: 0.5
+max_reward_if_repetitive: 0.4
+
+reward_budget_mode: threshold
+reward_beta: 2.0
+reward_mu: 0.0
+reward_rho: 0.0
+threshold_reward_hard_zero: false
+
+enable_verifier: true
+verifier_type: math
+verifier_schedule: final_only
+verifier_every_k_steps: 8
+verifier_threshold: 0.7
+
+enable_remasking: false
+remask_strategy: none
+max_remasks_per_sample: 0
+remask_answer_span_mode: numeric_only
+
+enable_posthoc_continuation: true
+continuation_force_for_analysis: true
+continuation_steps: [4]
+continuation_trigger: always_for_analysis
+continuation_remask_mode: answer_span
+continuation_final_window_tokens: 32
+continuation_low_confidence_quantile: 0.3
+continuation_min_remaining_budget: 4
+continuation_use_oracle_for_analysis: true
+continuation_select_best_k_oracle: false
+continuation_confidence_threshold: 0.5
+continuation_verifier_threshold: 0.7
+
+save_generations: true
+save_verifier_results: true
+save_continuation_records: true
+log_step_traces: false
+
+output_dir: outputs/llada_verifier_budget_gsm8k_continuation_1k_analysis

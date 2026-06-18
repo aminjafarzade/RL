@@ -25,10 +25,34 @@ def test_math_verifier_normalizes_numeric_forms():
 
 def test_arithmetic_checker_valid_invalid_and_absent_equations():
     assert check_arithmetic("48 + 24 = 72") is True
+    assert check_arithmetic("2 + 3 = 5") is True
+    assert check_arithmetic("2 + 3 = 6") is False
     assert check_arithmetic("12 * 4 = 48 and 6 × 4 = 24") is True
     assert check_arithmetic("300 - 12 = 288") is True
     assert check_arithmetic("6 ÷ 4 = 2") is False
     assert check_arithmetic("No explicit equation here.") is None
+
+
+def test_arithmetic_checker_skips_repeated_number_text():
+    assert check_arithmetic("42 " * 10000) is None
+
+    result = MathVerifier().verify("42 " * 10000)
+    assert result.arithmetic_ok is None
+    assert result.flags["arithmetic_text_truncated"] is True
+    assert result.flags["arithmetic_skipped_repeated_number"] is True
+    assert result.flags["arithmetic_repeated_number"] == "42"
+
+
+def test_arithmetic_checker_reports_match_limit():
+    text = " ".join(f"{idx} + 1 = {idx + 1}" for idx in range(20))
+    result = MathVerifier(
+        max_equation_matches=3,
+        repeated_number_skip_threshold=0,
+    ).verify(text)
+
+    assert result.arithmetic_ok is True
+    assert result.flags["arithmetic_checked_equations"] == 3
+    assert result.flags["arithmetic_match_limit_hit"] is True
 
 
 def test_arithmetic_checker_rejects_unsafe_or_invalid_expressions():

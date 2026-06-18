@@ -18,3 +18,39 @@ wandb/
 runs/
 outputs/
 checkpoints/
+
+# Local datasets and Hugging Face caches.
+datasets/
+**/.hf_cache/
+*.arrow
+
+# Training checkpoints and model artifacts should be shared externally.
+**/checkpoint-*/
+**/checkpoint-best/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+pytorch_model*.bin
+adapter_model*.bin
+optimizer.pt
+scheduler.pt
+trainer_state.json
+rng_state*.pth
+
+# Local repair/archive scratch files.
+*.zip
+*.patch
+ml-rl-dllm/docs/codex_repair/
+ml-rl-dllm/AGENTS_REPAIR_APPEND.md
+
+# Accidental shell-fragment files from local experiment launches.
+ml-rl-dllm/*,
+ml-rl-dllm/PY
+ml-rl-dllm/cfg
+ml-rl-dllm/fail_with_unknown_args=False
+ml-rl-dllm/for
+ml-rl-dllm/from
+ml-rl-dllm/import
+ml-rl-dllm/keys
+ml-rl-dllm/sys.argv

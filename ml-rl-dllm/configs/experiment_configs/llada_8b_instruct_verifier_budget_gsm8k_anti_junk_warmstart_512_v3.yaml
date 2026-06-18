@@ -1,0 +1,155 @@
+# Anti-junk warm-start v2: source-aware reward with generous generation budget.
+#
+# Parser validation only; this should instantiate TrlParser dataclasses and print
+# key config values without launching training:
+# python -c 'import sys; from trl import ModelConfig, TrlParser; from common.config import Config; path="configs/experiment_configs/llada_8b_instruct_verifier_budget_gsm8k_anti_junk_warmstart_512_v2.yaml"; sys.argv=["config_check","--config",path]; cfg, model_cfg = TrlParser((Config, ModelConfig)).parse_args_and_config(fail_with_unknown_args=False); keys=("max_train_samples","max_eval_samples","max_completion_length","block_length","num_generations","per_device_train_batch_size","generation_batch_size","reward_quality_mode","reward_budget_mode","reward_beta","threshold_reward_hard_zero","target_budget","target_budgets","train_budget_sampling","hard_stop_at_target_budget","hard_generation_budget","train_rollout_compute_styles","patient_delay_low_confidence","patient_delay_final_window","enable_deliberation_probe","policy_smart_init","enable_posthoc_continuation","enable_remasking","remask_strategy","max_remasks_per_sample","method","output_dir"); print({k: getattr(cfg, k) for k in keys})'
+
+# Model
+torch_dtype: bfloat16
+load_in_4bit: false
+model_path: GSAI-ML/LLaDA-8B-Instruct
+attn_implementation: sdpa
+# Pick a large-memory GPU at runtime; explicit CUDA_VISIBLE_DEVICES still overrides this.
+cuda_min_memory_gb: 90
+
+# Dataset
+dataset: gsm8k
+max_train_samples: 512
+max_eval_samples: 128
+seed: 123
+bf16: false
+report_to: none
+
+# Optim
+adam_beta1: 0.9
+adam_beta2: 0.99
+weight_decay: 0.1
+max_grad_norm: 0.2
+warmup_steps: 50
+logging_steps: 5
+learning_rate: 3e-5
+lr_scheduler_type: cosine
+
+# Reward
+reward_functions:
+  - mixed_multiplicative_budget_reward_func
+reward_weights:
+  - 1.0
+
+reward_type: multiplicative_budget
+reward_gsm_extractor: answer_span
+reward_quality_mode: source_aware_anti_junk
+
+source_answer_marker_credit: 0.20
+source_final_line_credit: 0.15
+source_final_window_credit: 0.08
+source_incomplete_answer_tag_credit: 0.03
+source_other_answer_span_credit: 0.05
+
+enable_repetition_penalty: true
+repetition_min_tokens: 8
+repetition_number_run_threshold: 3
+repetition_token_run_threshold: 4
+repetition_bigram_run_threshold: 3
+repetition_answer_span_number_threshold: 2
+repetition_unique_ratio_threshold: 0.35
+repetition_max_freq_threshold: 0.25
+repetition_penalty_factor: 0.25
+zero_reward_if_repeated_answer_span: true
+
+enable_negative_junk_penalty: true
+repeated_junk_negative_reward: 0.01
+malformed_junk_negative_reward: 0.005
+incomplete_answer_tag_negative_reward: 0.005
+min_reward_floor: -0.03
+
+max_reward_if_malformed: 0.10
+max_reward_if_repetitive: 0.02
+
+reward_budget_mode: threshold
+reward_beta: 0.0
+reward_mu: 0.0
+reward_rho: 0.0
+threshold_reward_hard_zero: false
+
+# GRPO
+num_generations: 4
+num_train_epochs: 1
+per_device_train_batch_size: 8
+per_device_eval_batch_size: 4
+gradient_accumulation_steps: 1
+eval_strategy: steps
+eval_steps: 100
+save_steps: 100
+save_strategy: steps
+save_total_limit: 10
+
+# Generation
+max_completion_length: 128
+max_prompt_length: 200
+block_length: 32
+generation_batch_size: 8
+remasking: policy
+beta: 0.0
+epsilon: 0.5
+num_iterations: 2
+loglikelihood_dtype: float32
+
+# Policy
+policy_type: dit_confidence
+policy_hidden_dim: 128
+policy_feedforward_dim: 512
+policy_num_heads: 2
+policy_num_blocks: 1
+policy_dropout: 0.0
+policy_time_embed_dim: 128
+policy_full_context: true
+policy_smart_init: 0.0
+confidences_top_p: 1
+
+# Budget conditioning
+method: anti_junk_warmstart_v3
+enable_budget_conditioning: true
+target_budget: 96
+target_budgets: [64, 96, 128]
+train_budget_sampling: [64, 96, 128]
+hard_stop_at_target_budget: false
+hard_generation_budget: 128
+
+# Selective patient rollouts disabled for completion-first warm-start
+train_rollout_compute_styles: [normal, normal, normal, normal]
+patient_global_slowdown: false
+patient_delay_low_confidence: false
+patient_low_confidence_quantile: 0.30
+patient_delay_final_window: false
+patient_final_window_tokens: 32
+patient_final_window_min_steps_frac: 0.6
+patient_max_unmask_fraction: 0.80
+patient_min_steps_frac: 0.0
+
+enable_deliberation_probe: false
+deliberation_probe_frac: 0.5
+deliberation_bonus_weight: 0.0
+patient_win_bonus: 0.0
+patient_win_margin: 0.05
+
+# Verifier only for final metadata/reward formatting checks
+enable_verifier: true
+verifier_type: math
+verifier_schedule: final_only
+verifier_every_k_steps: 8
+verifier_threshold: 0.7
+
+# No continuation/remasking during base RL warm-start
+enable_posthoc_continuation: false
+enable_remasking: false
+remask_strategy: none
+max_remasks_per_sample: 0
+remask_rho: 0.0
+
+log_step_traces: false
+save_generations: true
+save_verifier_results: true
+count_verifier_time: true
+
+output_dir: outputs/llada_verifier_budget_gsm8k_anti_junk_warmstart_512_v3

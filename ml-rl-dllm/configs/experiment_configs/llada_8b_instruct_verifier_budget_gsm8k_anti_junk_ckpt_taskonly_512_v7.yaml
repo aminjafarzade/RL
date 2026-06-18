@@ -1,0 +1,153 @@
+#
+# For licensing see accompanying LICENSE file.
+# Copyright (C) 2026 Apple Inc. All Rights Reserved.
+#
+### Anti-junk checkpoint warm-start with task-quality-only reward.
+###
+### This disables budget multiplication so the warm-start optimizes source-aware
+### GSM8K answer quality before reintroducing budget pressure.
+
+# ModelConfig
+torch_dtype: bfloat16
+load_in_4bit: false
+model_path: GSAI-ML/LLaDA-8B-Instruct
+attn_implementation: sdpa
+
+# GRPOConfig
+dataset: gsm8k
+max_train_samples: 512
+max_eval_samples: 128
+seed: 123
+bf16: false
+report_to: none
+
+adam_beta1: 0.9
+adam_beta2: 0.99
+weight_decay: 0.1
+max_grad_norm: 0.2
+
+use_vllm: false
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.9
+
+warmup_steps: 20
+logging_steps: 5
+learning_rate: 1e-5
+lr_scheduler_type: cosine
+
+reward_functions:
+  - mixed_multiplicative_budget_reward_func
+reward_weights:
+  - 1.0
+
+reward_type: task_only
+reward_gsm_extractor: answer_span
+reward_lambda_compute: 0.01
+reward_normalize_compute: true
+reward_beta: 0.0
+reward_mu: 0.0
+reward_rho: 0.0
+
+num_generations: 4
+num_train_epochs: 1
+
+eval_strategy: steps
+eval_steps: 50
+per_device_eval_batch_size: 4
+per_device_train_batch_size: 8
+gradient_accumulation_steps: 1
+
+gradient_checkpointing: false
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+resume_from_checkpoint: false
+
+save_steps: 50
+save_strategy: steps
+save_total_limit: 20
+
+max_completion_length: 192
+max_prompt_length: 200
+block_length: 32
+generation_batch_size: 8
+remasking: policy
+beta: 0.0
+epsilon: 0.5
+num_iterations: 2
+loglikelihood_dtype: float32
+
+policy_type: dit_confidence
+policy_hidden_dim: 128
+policy_feedforward_dim: 512
+policy_num_heads: 2
+policy_num_blocks: 1
+policy_dropout: 0.0
+policy_time_embed_dim: 128
+policy_full_context: true
+policy_smart_init: -0.5
+confidences_top_p: 1
+
+method: anti_junk_ckpt_taskonly_v7
+enable_budget_conditioning: true
+target_budget: 32
+target_budgets: [16, 24, 32, 48]
+train_budget_sampling: [16, 24, 32, 48]
+hard_stop_at_target_budget: false
+hard_generation_budget: 96
+
+enable_verifier: true
+verifier_type: math
+verifier_schedule: final_only
+verifier_every_k_steps: 8
+verifier_threshold: 0.7
+
+enable_remasking: false
+remask_strategy: none
+max_remasks_per_sample: 0
+remask_cooldown_steps: 2
+min_steps_before_remask: 0
+remask_answer_span_mode: numeric_only
+remask_penalty: 0.0
+
+log_step_traces: false
+save_generations: true
+save_verifier_results: true
+count_verifier_time: true
+
+output_dir: outputs/llada_verifier_budget_gsm8k_anti_junk_ckpt_taskonly_512_v7
+policy_checkpoint_path: outputs/llada_verifier_budget_gsm8k_fast_1k_answer_span/checkpoint-best
+reward_quality_mode: source_aware_anti_junk
+reward_budget_mode: none
+threshold_reward_hard_zero: false
+source_answer_marker_credit: 0.35
+source_final_line_credit: 0.25
+source_final_window_credit: 0.15
+source_incomplete_answer_tag_credit: 0.08
+source_other_answer_span_credit: 0.10
+enable_repetition_penalty: true
+repetition_min_tokens: 8
+repetition_number_run_threshold: 3
+repetition_token_run_threshold: 4
+repetition_bigram_run_threshold: 3
+repetition_answer_span_number_threshold: 2
+repetition_unique_ratio_threshold: 0.35
+repetition_max_freq_threshold: 0.25
+repetition_penalty_factor: 0.25
+zero_reward_if_repeated_answer_span: true
+enable_negative_junk_penalty: false
+repeated_junk_negative_reward: 0.0
+malformed_junk_negative_reward: 0.0
+incomplete_answer_tag_negative_reward: 0.0
+min_reward_floor: 0.0
+max_reward_if_malformed: 0.30
+max_reward_if_repetitive: 0.05
+enable_posthoc_continuation: false
+remask_rho: 0.0
+train_rollout_compute_styles: [normal, normal, normal, normal]
+patient_global_slowdown: false
+patient_delay_low_confidence: false
+patient_delay_final_window: false
+enable_deliberation_probe: false
+deliberation_bonus_weight: 0.0
+patient_win_bonus: 0.0

@@ -6,6 +6,12 @@
 import os
 import tempfile
 from contextlib import nullcontext
+from pathlib import Path
+
+from common.cuda_env import set_cuda_visible_devices_from_argv
+
+
+set_cuda_visible_devices_from_argv()
 
 import accelerate
 import torch
@@ -26,6 +32,7 @@ from common.models.policy import DiTConfidencePolicy
 from common.models.policy import PolicyHFWrapper
 from common.policy_features import get_policy_extra_feature_names
 from common.rewards import select_reward_functions_from_config
+from common.rewards import validate_reward_type_matches_functions
 from common.s3 import S3UploadCallback
 from common.s3 import download_s3_checkpoint
 from common.s3 import get_latest_s3_checkpoint
@@ -83,12 +90,140 @@ def get_reward_functions(config: Config):
 load_dotenv()
 token = os.getenv("HF_TOKEN")
 if not token:
-    raise ValueError(
-        "Hugging Face token not found in environment variables. Please set HF_TOKEN."
-    )
+    print("HF_TOKEN not found; continuing without an explicit Hugging Face token.")
 
 
 MASK_TOKENS_MAP = {"LLaDA": 126336, "Dream": 151666}
+
+
+def _resolve_policy_checkpoint_file(checkpoint_path: str) -> Path:
+    expanded = Path(os.path.expandvars(os.path.expanduser(checkpoint_path)))
+    if not expanded.exists():
+        raise FileNotFoundError(
+            f"policy_checkpoint_path does not exist: {checkpoint_path}"
+        )
+    if expanded.is_file():
+        return expanded
+
+    preferred_names = (
+        "model.safetensors",
+        "pytorch_model.bin",
+        "policy.safetensors",
+        "policy.pt",
+        "policy.bin",
+        "checkpoint.pt",
+    )
+    for name in preferred_names:
+        candidate = expanded / name
+        if candidate.exists():
+            return candidate
+
+    candidates = []
+    for pattern in ("*.safetensors", "*.bin", "*.pt", "*.pth"):
+        candidates.extend(sorted(expanded.glob(pattern)))
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        candidate_names = ", ".join(path.name for path in candidates[:8])
+        raise FileNotFoundError(
+            "policy_checkpoint_path contains multiple candidate policy files "
+            f"without a preferred name: {checkpoint_path}. Candidates: {candidate_names}"
+        )
+    raise FileNotFoundError(
+        "policy_checkpoint_path must point to a policy checkpoint file or a "
+        "directory containing model.safetensors or pytorch_model.bin: "
+        f"{checkpoint_path}"
+    )
+
+
+def _load_policy_checkpoint(policy: PolicyHFWrapper, checkpoint_path: str, device):
+    checkpoint_file = _resolve_policy_checkpoint_file(checkpoint_path)
+    if checkpoint_file.suffix == ".safetensors":
+        try:
+            from safetensors.torch import load_file
+        except ImportError as exc:
+            raise ImportError(
+                "Loading a .safetensors policy checkpoint requires safetensors."
+            ) from exc
+        state_dict = load_file(str(checkpoint_file), device="cpu")
+    else:
+        state_dict = torch.load(
+            checkpoint_file,
+            map_location="cpu",
+        )
+        if isinstance(state_dict, dict) and "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        if isinstance(state_dict, dict) and "model" in state_dict:
+            state_dict = state_dict["model"]
+
+    if not isinstance(state_dict, dict):
+        raise ValueError(
+            f"Policy checkpoint did not contain a state dict: {checkpoint_file}"
+        )
+
+    load_result = policy.load_state_dict(state_dict, strict=False)
+    missing = list(load_result.missing_keys)
+    unexpected = list(load_result.unexpected_keys)
+    if missing or unexpected:
+        raise ValueError(
+            "Policy checkpoint keys did not match the configured policy. "
+            f"missing={missing}, unexpected={unexpected}, path={checkpoint_file}"
+        )
+    policy.to(device)
+    print(
+        "Loaded lightweight policy checkpoint "
+        f"from {checkpoint_file} "
+        f"(missing={missing}, unexpected={unexpected})"
+    )
+    return {
+        "policy_checkpoint_path_effective": str(checkpoint_file),
+        "policy_checkpoint_loaded": True,
+        "policy_checkpoint_missing_keys": missing,
+        "policy_checkpoint_unexpected_keys": unexpected,
+    }
+
+
+def _validate_mixed_reward_functions(grpo_config):
+    if grpo_config.reward_functions is None:
+        return
+    assert (
+        "mixed_correctness_mult_reward_func" in grpo_config.reward_functions
+        or "mixed_correctness_add_reward_func" in grpo_config.reward_functions
+        or "mixed_additive_proposal_reward_func" in grpo_config.reward_functions
+        or "mixed_multiplicative_budget_reward_func" in grpo_config.reward_functions
+    )
+
+
+def _load_dataset_for_config(grpo_config, split: str):
+    if grpo_config.dataset in {"mbpp", "humaneval"}:
+        raise ValueError(
+            f"Training not supported for {grpo_config.dataset}. "
+            "This dataset is evaluation-only."
+        )
+    if grpo_config.dataset == "gsm8k":
+        return get_gsm8k_questions(split)
+    if grpo_config.dataset == "math":
+        return get_math_questions(split)
+    if grpo_config.dataset == "gsm8k_and_math":
+        _validate_mixed_reward_functions(grpo_config)
+        return get_gsm8k_and_math_questions(split, seed=grpo_config.seed)
+    if grpo_config.dataset == "gsm8k_and_math_and_kodcode":
+        _validate_mixed_reward_functions(grpo_config)
+        return get_gsm8k_and_math_and_kodcode_questions(
+            split, seed=grpo_config.seed
+        )
+    if grpo_config.dataset == "kodcode":
+        return get_kodcode_questions()
+    raise ValueError(f"Dataset {grpo_config.dataset} not supported")
+
+
+def _shuffle_and_limit_dataset(dataset, seed: int, max_samples: int | None, name: str):
+    dataset = dataset.shuffle(seed=seed)
+    if max_samples is not None:
+        sample_count = min(int(max_samples), len(dataset))
+        dataset = dataset.select(range(sample_count))
+    print(f"{name} samples: {len(dataset)}")
+    return dataset
 
 
 def main(grpo_config, model_config):
@@ -112,48 +247,33 @@ def main(grpo_config, model_config):
         assert grpo_config.block_length == 256
         assert grpo_config.policy_full_context
 
-    if grpo_config.dataset in {"mbpp", "humaneval"}:
-        raise ValueError(
-            f"Training not supported for {grpo_config.dataset}. "
-            "This dataset is evaluation-only."
-        )
-    elif grpo_config.dataset == "gsm8k":
-        dataset = get_gsm8k_questions("train")
-    elif grpo_config.dataset == "math":
-        dataset = get_math_questions("train")
-    elif grpo_config.dataset == "gsm8k_and_math":
-        dataset = get_gsm8k_and_math_questions("train", seed=grpo_config.seed)
-        if grpo_config.reward_functions is not None:
-            assert (
-                "mixed_correctness_mult_reward_func" in grpo_config.reward_functions
-                or "mixed_correctness_add_reward_func" in grpo_config.reward_functions
-                or "mixed_additive_proposal_reward_func"
-                in grpo_config.reward_functions
-                or "mixed_multiplicative_budget_reward_func"
-                in grpo_config.reward_functions
-            )
-    elif grpo_config.dataset == "gsm8k_and_math_and_kodcode":
-        dataset = get_gsm8k_and_math_and_kodcode_questions(
-            "train", seed=grpo_config.seed
-        )
-        if grpo_config.reward_functions is not None:
-            assert (
-                "mixed_correctness_mult_reward_func" in grpo_config.reward_functions
-                or "mixed_correctness_add_reward_func" in grpo_config.reward_functions
-                or "mixed_additive_proposal_reward_func"
-                in grpo_config.reward_functions
-                or "mixed_multiplicative_budget_reward_func"
-                in grpo_config.reward_functions
-            )
-    elif grpo_config.dataset == "kodcode":
-        dataset = get_kodcode_questions()
-    else:
-        raise ValueError(f"Dataset {grpo_config.dataset} not supported")
-
+    validate_reward_type_matches_functions(grpo_config)
     reward_functions = get_reward_functions(grpo_config)
-    dataset = dataset.shuffle(seed=grpo_config.seed)
-    train_set = dataset
+    train_set = _shuffle_and_limit_dataset(
+        _load_dataset_for_config(grpo_config, "train"),
+        grpo_config.seed,
+        grpo_config.max_train_samples,
+        "Train",
+    )
+    eval_set = None
+    if grpo_config.max_eval_samples is not None:
+        eval_set = _shuffle_and_limit_dataset(
+            _load_dataset_for_config(grpo_config, "test"),
+            grpo_config.seed,
+            grpo_config.max_eval_samples,
+            "Eval",
+        )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        current_device = torch.cuda.current_device()
+        print(
+            "CUDA_VISIBLE_DEVICES="
+            f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<all>')}; "
+            f"using process cuda:{current_device} "
+            f"({torch.cuda.get_device_name(current_device)})"
+        )
+    else:
+        print("CUDA is not available; using CPU.")
 
     # 4 bit quantization configuration (only if enabled in ModelConfig)
     # For the paper, we left this turned off.
@@ -231,6 +351,31 @@ def main(grpo_config, model_config):
         )
 
     policy = PolicyHFWrapper(policy_core, grpo_config.policy_type)
+    loaded_policy_checkpoint = {
+        "policy_checkpoint_path_effective": None,
+        "policy_checkpoint_loaded": False,
+        "policy_checkpoint_missing_keys": [],
+        "policy_checkpoint_unexpected_keys": [],
+    }
+    if grpo_config.policy_checkpoint_path:
+        loaded_policy_checkpoint = _load_policy_checkpoint(
+            policy,
+            grpo_config.policy_checkpoint_path,
+            device,
+        )
+        grpo_config.policy_checkpoint_path_effective = loaded_policy_checkpoint[
+            "policy_checkpoint_path_effective"
+        ]
+        grpo_config.policy_checkpoint_loaded = loaded_policy_checkpoint[
+            "policy_checkpoint_loaded"
+        ]
+        grpo_config.policy_checkpoint_missing_keys = loaded_policy_checkpoint[
+            "policy_checkpoint_missing_keys"
+        ]
+        grpo_config.policy_checkpoint_unexpected_keys = loaded_policy_checkpoint[
+            "policy_checkpoint_unexpected_keys"
+        ]
+        print(f"policy_checkpoint_path: {grpo_config.policy_checkpoint_path}")
 
     # Log policy parameter count
     total_params = sum(p.numel() for p in policy_core.parameters())
@@ -248,6 +393,12 @@ def main(grpo_config, model_config):
                 "policy/total_parameters": total_params,
                 "policy/trainable_parameters": trainable_params,
                 "policy/policy_type": grpo_config.policy_type,
+                "policy/checkpoint_path": (
+                    loaded_policy_checkpoint["policy_checkpoint_path_effective"] or ""
+                ),
+                "policy/checkpoint_loaded": float(
+                    loaded_policy_checkpoint["policy_checkpoint_loaded"]
+                ),
             },
             step=0,
         )
@@ -288,6 +439,7 @@ def main(grpo_config, model_config):
             dllm=model,
             reward_funcs=reward_functions,
             train_dataset=train_set,
+            eval_dataset=eval_set,
             processing_class=tokenizer,
             callbacks=callbacks,
         )

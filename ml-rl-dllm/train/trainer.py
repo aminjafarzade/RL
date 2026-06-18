@@ -32,10 +32,20 @@ from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.grpo_trainer import GRPOTrainer
 from trl.trainer.utils import print_prompt_completions_sample
 
+from common.budgeting import assign_rollout_compute_styles
+from common.budgeting import sample_group_target_budgets
 from common.generation.generation import generate_unified
 from common.generation.sampling import bernoulli_batch_loglik
 from common.generation.sampling import dpls_batch_loglik
 from common.policy_features import get_policy_extra_feature_names
+from common.rewards import apply_reward_quality_caps
+from common.rewards import apply_negative_junk_penalty
+from common.rewards import compute_budget_reward
+from common.rewards import compute_gsm_reward_parse_fields
+from common.rewards import compute_reward_quality
+from common.rewards import deliberation_bonus
+from common.rewards import has_malformed_answer_structure
+from common.rewards import patient_win_bonus_applies
 from common.s3 import S3UploadCallback
 
 try:
@@ -46,6 +56,83 @@ except ImportError:
     _rich_available = False
 
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
+
+def _jsonable(value):
+    if isinstance(value, torch.Tensor):
+        if value.ndim == 0:
+            return value.detach().cpu().item()
+        return value.detach().cpu().tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def _effective_reward_budget_mode(args) -> str:
+    if getattr(args, "reward_type", None) == "task_only":
+        return "none"
+    return getattr(args, "reward_budget_mode", "cap")
+
+
+def _uses_task_only_quality_scale(args) -> bool:
+    return _effective_reward_budget_mode(args) == "none"
+
+
+def _reward_quality_kwargs_from_args(args) -> dict[str, Any]:
+    return {
+        "extractor_mode": args.reward_gsm_extractor,
+        "reward_quality_mode": args.reward_quality_mode,
+        "answer_span_partial_credit": args.answer_span_partial_credit,
+        "malformed_answer_factor": args.malformed_answer_factor,
+        "source_answer_marker_credit": args.source_answer_marker_credit,
+        "source_final_line_credit": args.source_final_line_credit,
+        "source_final_window_credit": args.source_final_window_credit,
+        "source_incomplete_answer_tag_credit": (
+            args.source_incomplete_answer_tag_credit
+        ),
+        "source_other_answer_span_credit": args.source_other_answer_span_credit,
+        "enable_repetition_penalty": args.enable_repetition_penalty,
+        "repetition_min_tokens": args.repetition_min_tokens,
+        "repetition_number_run_threshold": args.repetition_number_run_threshold,
+        "repetition_token_run_threshold": args.repetition_token_run_threshold,
+        "repetition_bigram_run_threshold": args.repetition_bigram_run_threshold,
+        "repetition_answer_span_number_threshold": (
+            args.repetition_answer_span_number_threshold
+        ),
+        "repetition_unique_ratio_threshold": args.repetition_unique_ratio_threshold,
+        "repetition_max_freq_threshold": args.repetition_max_freq_threshold,
+        "repetition_penalty_factor": args.repetition_penalty_factor,
+        "zero_reward_if_repeated_answer_span": (
+            args.zero_reward_if_repeated_answer_span
+        ),
+    }
+
+
+def _gsm_reward_parse_fields(
+    generated_text: str | None,
+    reference_answer,
+    args,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return compute_gsm_reward_parse_fields(
+        generated_text,
+        reference_answer,
+        args,
+        metadata,
+    )
+
+
+def _visible_token_count(tokenizer, text: str | None) -> int | None:
+    if tokenizer is None or text is None:
+        return None
+    try:
+        return len(tokenizer.encode(text, add_special_tokens=False))
+    except Exception:
+        return None
 
 
 class Trainer(GRPOTrainer):
@@ -112,6 +199,692 @@ class Trainer(GRPOTrainer):
             if isinstance(callback, S3UploadCallback):
                 self.s3_callback = callback
                 break
+
+    def _write_generation_records(
+        self,
+        *,
+        mode: str,
+        inputs: list[dict[str, Any]],
+        prompts_text: list[str],
+        completions_text: list[str],
+        metadata: list[dict[str, Any]],
+        rewards: torch.Tensor,
+        rewards_per_func: torch.Tensor,
+    ) -> None:
+        if not self.accelerator.is_main_process:
+            return
+        if not (self.args.save_generations or self.args.save_verifier_results):
+            return
+
+        os.makedirs(self.args.output_dir, exist_ok=True)
+        reward_names = [
+            reward_func.__name__
+            if not isinstance(reward_func, nn.Module)
+            else reward_func.config._name_or_path.split("/")[-1]
+            for reward_func in self.reward_funcs
+        ]
+        rewards_list = rewards.detach().cpu().tolist()
+        rewards_per_func_list = rewards_per_func.detach().cpu().tolist()
+        effective_reward_budget_mode = _effective_reward_budget_mode(self.args)
+        task_only_quality_scale = _uses_task_only_quality_scale(self.args)
+        task_scores_for_pairs: list[float | None] = []
+        quality_for_caps: list[dict[str, Any] | None] = []
+        uncapped_rewards: list[float | None] = []
+        threshold_gates_for_caps: list[float | None] = []
+        for idx, example in enumerate(inputs):
+            item_metadata = metadata[idx] if idx < len(metadata) else {}
+            generated_text = (
+                completions_text[idx]
+                if idx < len(completions_text)
+                else item_metadata.get("generated_text_final")
+            )
+            if example.get("dataset_type", self.args.dataset) == "gsm8k":
+                quality = compute_reward_quality(
+                    generated_text,
+                    example.get("answer"),
+                    format_ok=item_metadata.get("format_ok"),
+                    **_reward_quality_kwargs_from_args(self.args),
+                )
+                task_score = quality.task_score
+                if not task_only_quality_scale:
+                    task_score *= float(self.args.alpha_correctness_reward)
+                is_clean_format = bool(quality.strict_correct) or bool(
+                    quality.format_ok
+                )
+                repeated_junk_detected = bool(quality.repeated_junk_detected) or (
+                    float(quality.repetition_penalty) < 1.0
+                )
+                if not task_only_quality_scale:
+                    task_score_cap = apply_reward_quality_caps(
+                        reward=task_score,
+                        is_malformed=not is_clean_format,
+                        repeated_junk_detected=repeated_junk_detected,
+                        max_reward_if_malformed=self.args.max_reward_if_malformed,
+                        max_reward_if_repetitive=self.args.max_reward_if_repetitive,
+                    )
+                    task_score = task_score_cap.reward_after_quality_caps
+                task_scores_for_pairs.append(task_score)
+                budget = compute_budget_reward(
+                    task_score=task_score,
+                    nfe_used=item_metadata.get(
+                        "actual_nfe",
+                        item_metadata.get("nfe_used", 0),
+                    ),
+                    target_budget=item_metadata.get(
+                        "target_budget",
+                        getattr(self.args, "target_budget", 1),
+                    ),
+                    max_steps=item_metadata.get(
+                        "max_steps",
+                        getattr(self.args, "max_completion_length", 1),
+                    ),
+                    remask_count=item_metadata.get("remask_count", 0),
+                    reward_budget_mode=effective_reward_budget_mode,
+                    reward_beta=self.args.reward_beta,
+                    reward_mu=self.args.reward_mu,
+                    reward_rho=self.args.reward_rho,
+                    threshold_reward_hard_zero=self.args.threshold_reward_hard_zero,
+                )
+                early_score = 0.0
+                early_text = item_metadata.get("early_generated_text")
+                if early_text is not None:
+                    early_score = compute_reward_quality(
+                        early_text,
+                        example.get("answer"),
+                        format_ok=None,
+                        **_reward_quality_kwargs_from_args(self.args),
+                    ).task_score
+                    if not task_only_quality_scale:
+                        early_score *= float(self.args.alpha_correctness_reward)
+                _, probe_bonus = deliberation_bonus(
+                    early_task_score=early_score,
+                    final_task_score=task_score,
+                    threshold_gate=budget.threshold_gate,
+                    deliberation_bonus_weight=self.args.deliberation_bonus_weight,
+                )
+                reward_before_caps = budget.reward
+                if (
+                    self.args.enable_deliberation_probe
+                    and effective_reward_budget_mode != "none"
+                ):
+                    reward_before_caps += probe_bonus
+                quality_for_caps.append(
+                    {
+                        "strict_correct": quality.strict_correct,
+                        "format_ok": item_metadata.get("format_ok"),
+                        "repetition_penalty": quality.repetition_penalty,
+                        "repeated_char_run_detected": (
+                            quality.repeated_char_run_detected
+                        ),
+                        "repeated_junk_detected": quality.repeated_junk_detected,
+                        "answer_source": quality.answer_source,
+                        "has_malformed_answer_structure": (
+                            has_malformed_answer_structure(generated_text)
+                        ),
+                    }
+                )
+                uncapped_rewards.append(float(reward_before_caps))
+                threshold_gates_for_caps.append(budget.threshold_gate)
+            else:
+                task_scores_for_pairs.append(None)
+                quality_for_caps.append(None)
+                uncapped_rewards.append(None)
+                threshold_gates_for_caps.append(None)
+
+        pair_statuses: dict[int, dict[str, bool]] = {}
+        grouped_indices: dict[Any, list[int]] = {}
+        for idx, item_metadata in enumerate(metadata):
+            group_id = item_metadata.get("group_id")
+            if group_id is not None:
+                grouped_indices.setdefault(group_id, []).append(idx)
+        for indices in grouped_indices.values():
+            normal_idx = next(
+                (
+                    idx
+                    for idx in indices
+                    if metadata[idx].get("rollout_compute_style") == "normal"
+                ),
+                None,
+            )
+            patient_idx = next(
+                (
+                    idx
+                    for idx in indices
+                    if metadata[idx].get("rollout_compute_style") == "patient"
+                ),
+                None,
+            )
+            if normal_idx is None or patient_idx is None:
+                continue
+            normal_score = task_scores_for_pairs[normal_idx]
+            patient_score = task_scores_for_pairs[patient_idx]
+            if normal_score is None or patient_score is None:
+                continue
+            if (
+                effective_reward_budget_mode != "none"
+                and self.args.patient_win_bonus > 0.0
+                and uncapped_rewards[patient_idx] is not None
+                and patient_win_bonus_applies(
+                    patient_task_score=patient_score,
+                    normal_task_score=normal_score,
+                    patient_nfe=metadata[patient_idx].get(
+                        "actual_nfe",
+                        metadata[patient_idx].get("nfe_used", 0),
+                    ),
+                    target_budget=metadata[patient_idx].get(
+                        "target_budget",
+                        getattr(self.args, "target_budget", 1),
+                    ),
+                    patient_win_margin=self.args.patient_win_margin,
+                )
+            ):
+                uncapped_rewards[patient_idx] += (
+                    self.args.patient_win_bonus
+                    * float(threshold_gates_for_caps[patient_idx] or 0.0)
+                )
+            if mode == "train":
+                status = {
+                    "patient_correct_normal_wrong": (
+                        patient_score > 0.0 and normal_score <= 0.0
+                    ),
+                    "normal_correct_patient_wrong": (
+                        normal_score > 0.0 and patient_score <= 0.0
+                    ),
+                    "patient_better_than_normal": (
+                        patient_score > normal_score + self.args.patient_win_margin
+                    ),
+                    "both_good": normal_score > 0.0 and patient_score > 0.0,
+                    "both_bad": normal_score <= 0.0 and patient_score <= 0.0,
+                }
+                pair_statuses[normal_idx] = status
+                pair_statuses[patient_idx] = status
+
+        cap_fields_by_idx: dict[int, dict[str, Any]] = {}
+        for idx, reward_before_caps in enumerate(uncapped_rewards):
+            quality = quality_for_caps[idx]
+            if reward_before_caps is None or quality is None:
+                continue
+            if task_only_quality_scale:
+                repeated_junk_detected = bool(quality["repeated_junk_detected"]) or (
+                    float(quality["repetition_penalty"]) < 1.0
+                )
+                negative = apply_negative_junk_penalty(
+                    reward=reward_before_caps,
+                    strict_correct=bool(quality["strict_correct"]),
+                    repeated_junk_detected=repeated_junk_detected,
+                    malformed_junk_detected=bool(
+                        quality["has_malformed_answer_structure"]
+                    ),
+                    answer_source=quality.get("answer_source"),
+                    enable_negative_junk_penalty=(
+                        self.args.enable_negative_junk_penalty
+                    ),
+                    repeated_junk_negative_reward=(
+                        self.args.repeated_junk_negative_reward
+                    ),
+                    malformed_junk_negative_reward=(
+                        self.args.malformed_junk_negative_reward
+                    ),
+                    incomplete_answer_tag_negative_reward=(
+                        self.args.incomplete_answer_tag_negative_reward
+                    ),
+                    min_reward_floor=self.args.min_reward_floor,
+                )
+                cap_fields_by_idx[idx] = {
+                    "max_reward_if_malformed": self.args.max_reward_if_malformed,
+                    "max_reward_if_repetitive": self.args.max_reward_if_repetitive,
+                    "reward_before_quality_caps": reward_before_caps,
+                    "reward_after_quality_caps": reward_before_caps,
+                    "malformed_reward_cap_applied": False,
+                    "repetitive_reward_cap_applied": False,
+                    "malformed_capped": False,
+                    "repetitive_capped": False,
+                    "enable_negative_junk_penalty": (
+                        self.args.enable_negative_junk_penalty
+                    ),
+                    "repeated_junk_negative_reward": (
+                        self.args.repeated_junk_negative_reward
+                    ),
+                    "malformed_junk_negative_reward": (
+                        self.args.malformed_junk_negative_reward
+                    ),
+                    "incomplete_answer_tag_negative_reward": (
+                        self.args.incomplete_answer_tag_negative_reward
+                    ),
+                    "min_reward_floor": self.args.min_reward_floor,
+                    "reward_before_negative_junk_penalty": (
+                        negative.reward_before_negative_junk_penalty
+                    ),
+                    "reward_after_negative_junk_penalty": (
+                        negative.reward_after_negative_junk_penalty
+                    ),
+                    "negative_junk_penalty": negative.negative_junk_penalty,
+                    "repeated_junk_negative_penalty_applied": (
+                        negative.repeated_junk_negative_penalty_applied
+                    ),
+                    "malformed_junk_negative_penalty_applied": (
+                        negative.malformed_junk_negative_penalty_applied
+                    ),
+                    "incomplete_answer_tag_negative_penalty_applied": (
+                        negative.incomplete_answer_tag_negative_penalty_applied
+                    ),
+                }
+                continue
+            is_clean_format = bool(quality["strict_correct"]) or bool(
+                quality["format_ok"]
+            )
+            repeated_junk_detected = bool(quality["repeated_junk_detected"]) or (
+                float(quality["repetition_penalty"]) < 1.0
+            )
+            cap = apply_reward_quality_caps(
+                reward=reward_before_caps,
+                is_malformed=not is_clean_format,
+                repeated_junk_detected=repeated_junk_detected,
+                max_reward_if_malformed=self.args.max_reward_if_malformed,
+                max_reward_if_repetitive=self.args.max_reward_if_repetitive,
+            )
+            cap_fields_by_idx[idx] = {
+                "max_reward_if_malformed": self.args.max_reward_if_malformed,
+                "max_reward_if_repetitive": self.args.max_reward_if_repetitive,
+                "reward_before_quality_caps": (
+                    cap.reward_before_quality_caps
+                ),
+                "reward_after_quality_caps": cap.reward_after_quality_caps,
+                "malformed_reward_cap_applied": (
+                    cap.malformed_reward_cap_applied
+                ),
+                "repetitive_reward_cap_applied": (
+                    cap.repetitive_reward_cap_applied
+                ),
+                "malformed_capped": cap.malformed_reward_cap_applied,
+                "repetitive_capped": cap.repetitive_reward_cap_applied,
+            }
+            negative = apply_negative_junk_penalty(
+                reward=cap.reward_after_quality_caps,
+                strict_correct=bool(quality["strict_correct"]),
+                repeated_junk_detected=repeated_junk_detected,
+                malformed_junk_detected=bool(
+                    quality["has_malformed_answer_structure"]
+                ),
+                answer_source=quality.get("answer_source"),
+                enable_negative_junk_penalty=self.args.enable_negative_junk_penalty,
+                repeated_junk_negative_reward=(
+                    self.args.repeated_junk_negative_reward
+                ),
+                malformed_junk_negative_reward=(
+                    self.args.malformed_junk_negative_reward
+                ),
+                incomplete_answer_tag_negative_reward=(
+                    self.args.incomplete_answer_tag_negative_reward
+                ),
+                min_reward_floor=self.args.min_reward_floor,
+            )
+            cap_fields_by_idx[idx].update(
+                {
+                    "enable_negative_junk_penalty": (
+                        self.args.enable_negative_junk_penalty
+                    ),
+                    "repeated_junk_negative_reward": (
+                        self.args.repeated_junk_negative_reward
+                    ),
+                    "malformed_junk_negative_reward": (
+                        self.args.malformed_junk_negative_reward
+                    ),
+                    "incomplete_answer_tag_negative_reward": (
+                        self.args.incomplete_answer_tag_negative_reward
+                    ),
+                    "min_reward_floor": self.args.min_reward_floor,
+                    "reward_before_negative_junk_penalty": (
+                        negative.reward_before_negative_junk_penalty
+                    ),
+                    "reward_after_negative_junk_penalty": (
+                        negative.reward_after_negative_junk_penalty
+                    ),
+                    "negative_junk_penalty": negative.negative_junk_penalty,
+                    "repeated_junk_negative_penalty_applied": (
+                        negative.repeated_junk_negative_penalty_applied
+                    ),
+                    "malformed_junk_negative_penalty_applied": (
+                        negative.malformed_junk_negative_penalty_applied
+                    ),
+                    "incomplete_answer_tag_negative_penalty_applied": (
+                        negative.incomplete_answer_tag_negative_penalty_applied
+                    ),
+                }
+            )
+
+        per_example_path = os.path.join(self.args.output_dir, "per_example.jsonl")
+        generations_path = os.path.join(self.args.output_dir, "generations.jsonl")
+        verifier_path = os.path.join(self.args.output_dir, "verifier_results.jsonl")
+        eval_samples_path = os.path.join(self.args.output_dir, "eval_samples.jsonl")
+
+        with open(per_example_path, "a") as per_example_file:
+            generations_file = (
+                open(generations_path, "a") if self.args.save_generations else None
+            )
+            verifier_file = (
+                open(verifier_path, "a") if self.args.save_verifier_results else None
+            )
+            eval_samples_file = (
+                open(eval_samples_path, "a") if mode == "eval" else None
+            )
+            try:
+                for idx, example in enumerate(inputs):
+                    item_metadata = metadata[idx] if idx < len(metadata) else {}
+                    generated_text = (
+                        completions_text[idx]
+                        if idx < len(completions_text)
+                        else item_metadata.get("generated_text_final")
+                    )
+                    reference_answer = example.get("answer")
+                    dataset_name = example.get("dataset_type", self.args.dataset)
+                    gsm_fields = (
+                        _gsm_reward_parse_fields(
+                            generated_text,
+                            reference_answer,
+                            self.args,
+                            item_metadata,
+                        )
+                        if dataset_name == "gsm8k"
+                        else {}
+                    )
+                    visible_generated_char_count = len(generated_text or "")
+                    visible_generated_token_count = _visible_token_count(
+                        self.processing_class,
+                        generated_text,
+                    )
+                    reward_components = {
+                        reward_names[j]: rewards_per_func_list[idx][j]
+                        for j in range(len(reward_names))
+                    }
+                    record = {
+                        **item_metadata,
+                        **gsm_fields,
+                        "mode": mode,
+                        "trainer_global_step": int(self.state.global_step),
+                        "generation_step": int(self._step),
+                        "example_id": f"{mode}-{self.state.global_step}-{idx}",
+                        "dataset": dataset_name,
+                        "prompt": prompts_text[idx] if idx < len(prompts_text) else None,
+                        "reference_answer": reference_answer,
+                        "generated_text": generated_text,
+                        "generated_text_final": item_metadata.get(
+                            "generated_text_final",
+                            generated_text,
+                        ),
+                        "visible_generated_char_count": visible_generated_char_count,
+                        "visible_generated_token_count": visible_generated_token_count,
+                        "reward": rewards_list[idx],
+                        "final_reward": rewards_list[idx],
+                        "reward_components": reward_components,
+                        **cap_fields_by_idx.get(idx, {}),
+                        **pair_statuses.get(idx, {}),
+                        "config_dataset": self.args.dataset,
+                        "method_name": self.args.method,
+                        "reward_type": self.args.reward_type,
+                        "reward_type/task_only": float(
+                            self.args.reward_type == "task_only"
+                        ),
+                        "reward_gsm_extractor": self.args.reward_gsm_extractor,
+                        "reward_quality_mode": self.args.reward_quality_mode,
+                        "answer_span_partial_credit": (
+                            self.args.answer_span_partial_credit
+                        ),
+                        "malformed_answer_factor": self.args.malformed_answer_factor,
+                        "source_answer_marker_credit": (
+                            self.args.source_answer_marker_credit
+                        ),
+                        "source_final_line_credit": (
+                            self.args.source_final_line_credit
+                        ),
+                        "source_final_window_credit": (
+                            self.args.source_final_window_credit
+                        ),
+                        "source_incomplete_answer_tag_credit": (
+                            self.args.source_incomplete_answer_tag_credit
+                        ),
+                        "source_other_answer_span_credit": (
+                            self.args.source_other_answer_span_credit
+                        ),
+                        "enable_repetition_penalty": (
+                            self.args.enable_repetition_penalty
+                        ),
+                        "repetition_min_tokens": self.args.repetition_min_tokens,
+                        "repetition_number_run_threshold": (
+                            self.args.repetition_number_run_threshold
+                        ),
+                        "repetition_token_run_threshold": (
+                            self.args.repetition_token_run_threshold
+                        ),
+                        "repetition_bigram_run_threshold": (
+                            self.args.repetition_bigram_run_threshold
+                        ),
+                        "repetition_answer_span_number_threshold": (
+                            self.args.repetition_answer_span_number_threshold
+                        ),
+                        "repetition_unique_ratio_threshold": (
+                            self.args.repetition_unique_ratio_threshold
+                        ),
+                        "repetition_max_freq_threshold": (
+                            self.args.repetition_max_freq_threshold
+                        ),
+                        "repetition_penalty_factor": (
+                            self.args.repetition_penalty_factor
+                        ),
+                        "zero_reward_if_repeated_answer_span": (
+                            self.args.zero_reward_if_repeated_answer_span
+                        ),
+                        "max_reward_if_malformed": (
+                            self.args.max_reward_if_malformed
+                        ),
+                        "max_reward_if_repetitive": (
+                            self.args.max_reward_if_repetitive
+                        ),
+                        "enable_negative_junk_penalty": (
+                            self.args.enable_negative_junk_penalty
+                        ),
+                        "repeated_junk_negative_reward": (
+                            self.args.repeated_junk_negative_reward
+                        ),
+                        "malformed_junk_negative_reward": (
+                            self.args.malformed_junk_negative_reward
+                        ),
+                        "incomplete_answer_tag_negative_reward": (
+                            self.args.incomplete_answer_tag_negative_reward
+                        ),
+                        "min_reward_floor": self.args.min_reward_floor,
+                        "reward_budget_mode": effective_reward_budget_mode,
+                        "threshold_reward_hard_zero": (
+                            self.args.threshold_reward_hard_zero
+                        ),
+                        "policy_smart_init": self.args.policy_smart_init,
+                        "policy_checkpoint_path": self.args.policy_checkpoint_path,
+                        "policy_checkpoint_path_requested": (
+                            self.args.policy_checkpoint_path
+                        ),
+                        "policy_checkpoint_path_effective": (
+                            self.args.policy_checkpoint_path_effective
+                        ),
+                        "policy_checkpoint_loaded": (
+                            self.args.policy_checkpoint_loaded
+                        ),
+                        "policy_checkpoint_missing_keys": list(
+                            self.args.policy_checkpoint_missing_keys
+                        ),
+                        "policy_checkpoint_unexpected_keys": list(
+                            self.args.policy_checkpoint_unexpected_keys
+                        ),
+                        "train_rollout_compute_styles": list(
+                            self.args.train_rollout_compute_styles
+                        ),
+                        "rollout_compute_style": item_metadata.get(
+                            "rollout_compute_style",
+                            "normal",
+                        ),
+                        "patient_unmask_logit_bias": (
+                            self.args.patient_unmask_logit_bias
+                        ),
+                        "patient_policy_temperature": (
+                            self.args.patient_policy_temperature
+                        ),
+                        "patient_max_unmask_fraction": (
+                            self.args.patient_max_unmask_fraction
+                        ),
+                        "patient_min_steps_frac": self.args.patient_min_steps_frac,
+                        "patient_global_slowdown": self.args.patient_global_slowdown,
+                        "patient_delay_low_confidence": (
+                            self.args.patient_delay_low_confidence
+                        ),
+                        "patient_low_confidence_quantile": (
+                            self.args.patient_low_confidence_quantile
+                        ),
+                        "patient_delay_final_window": (
+                            self.args.patient_delay_final_window
+                        ),
+                        "patient_final_window_tokens": (
+                            self.args.patient_final_window_tokens
+                        ),
+                        "patient_final_window_min_steps_frac": (
+                            self.args.patient_final_window_min_steps_frac
+                        ),
+                        "enable_deliberation_probe": (
+                            self.args.enable_deliberation_probe
+                        ),
+                        "deliberation_probe_frac": self.args.deliberation_probe_frac,
+                        "deliberation_bonus_weight": (
+                            self.args.deliberation_bonus_weight
+                        ),
+                        "patient_win_bonus": self.args.patient_win_bonus,
+                        "patient_win_margin": self.args.patient_win_margin,
+                        "enable_posthoc_continuation": (
+                            self.args.enable_posthoc_continuation
+                        ),
+                        "continuation_steps_config": list(
+                            self.args.continuation_steps
+                        ),
+                        "continuation_trigger_config": (
+                            self.args.continuation_trigger
+                        ),
+                        "continuation_remask_mode_config": (
+                            self.args.continuation_remask_mode
+                        ),
+                        "continuation_final_window_tokens": (
+                            self.args.continuation_final_window_tokens
+                        ),
+                        "continuation_low_confidence_quantile": (
+                            self.args.continuation_low_confidence_quantile
+                        ),
+                        "continuation_min_remaining_budget": (
+                            self.args.continuation_min_remaining_budget
+                        ),
+                        "continuation_use_oracle_for_analysis": (
+                            self.args.continuation_use_oracle_for_analysis
+                        ),
+                        "continuation_force_for_analysis": (
+                            self.args.continuation_force_for_analysis
+                        ),
+                        "continuation_select_best_k_oracle": (
+                            self.args.continuation_select_best_k_oracle
+                        ),
+                        "continuation_confidence_threshold": (
+                            self.args.continuation_confidence_threshold
+                        ),
+                        "continuation_verifier_threshold": (
+                            self.args.continuation_verifier_threshold
+                        ),
+                        "num_generations": self.args.num_generations,
+                        "max_completion_length": self.args.max_completion_length,
+                        "block_length": self.args.block_length,
+                        "generation_batch_size": self.args.generation_batch_size,
+                        "per_device_train_batch_size": self.args.per_device_train_batch_size,
+                        "target_budgets_config": list(self.args.target_budgets),
+                        "train_budget_sampling_config": list(
+                            self.args.train_budget_sampling
+                        ),
+                        "enable_budget_conditioning": self.args.enable_budget_conditioning,
+                        "enable_verifier": self.args.enable_verifier,
+                        "verifier_type": self.args.verifier_type,
+                        "verifier_schedule": self.args.verifier_schedule,
+                        "enable_remasking": self.args.enable_remasking,
+                        "max_remasks_per_sample": self.args.max_remasks_per_sample,
+                        "hard_stop_at_target_budget": item_metadata.get(
+                            "hard_stop_at_target_budget",
+                            self.args.hard_stop_at_target_budget,
+                        ),
+                        "configured_hard_stop_at_target_budget": (
+                            self.args.hard_stop_at_target_budget
+                        ),
+                        "hard_generation_budget": item_metadata.get(
+                            "hard_generation_budget",
+                            self.args.hard_generation_budget,
+                        ),
+                        "reward_beta": self.args.reward_beta,
+                        "reward_mu": self.args.reward_mu,
+                        "reward_rho": self.args.reward_rho,
+                    }
+                    line = json.dumps(_jsonable(record), sort_keys=False)
+                    per_example_file.write(line + "\n")
+                    if generations_file is not None:
+                        generations_file.write(line + "\n")
+                    if verifier_file is not None:
+                        verifier_record = {
+                            "mode": record["mode"],
+                            "trainer_global_step": record["trainer_global_step"],
+                            "example_id": record["example_id"],
+                            "dataset": record["dataset"],
+                            "target_budget": record.get("target_budget"),
+                            "nfe_used": record.get("nfe_used"),
+                            "actual_nfe": record.get("actual_nfe"),
+                            "verifier_calls": record.get("verifier_calls"),
+                            "final_verifier_score": record.get(
+                                "final_verifier_score"
+                            ),
+                            "parse_ok": record.get("parse_ok"),
+                            "format_ok": record.get("format_ok"),
+                            "arithmetic_ok": record.get("arithmetic_ok"),
+                            "parsed_answer": record.get("parsed_answer"),
+                            "verifier_result": record.get("verifier_result"),
+                        }
+                        verifier_file.write(
+                            json.dumps(_jsonable(verifier_record), sort_keys=False)
+                            + "\n"
+                        )
+                    if eval_samples_file is not None:
+                        eval_record = {
+                            "prompt": record.get("prompt"),
+                            "reference_answer": record.get("reference_answer"),
+                            "generated_text_final": record.get(
+                                "generated_text_final"
+                            ),
+                            "strict_parsed_answer": record.get(
+                                "strict_parsed_answer"
+                            ),
+                            "answer_span_parsed_answer": record.get(
+                                "answer_span_parsed_answer"
+                            ),
+                            "robust_parsed_answer": record.get(
+                                "robust_parsed_answer"
+                            ),
+                            "strict_correct": record.get("strict_correct"),
+                            "answer_span_correct": record.get("answer_span_correct"),
+                            "robust_correct": record.get("robust_correct"),
+                            "reward_answer_source": record.get(
+                                "reward_answer_source"
+                            ),
+                            "reward": record.get("reward"),
+                            "target_budget": record.get("target_budget"),
+                            "nfe_used": record.get("nfe_used"),
+                        }
+                        eval_samples_file.write(
+                            json.dumps(_jsonable(eval_record), sort_keys=False) + "\n"
+                        )
+            finally:
+                if generations_file is not None:
+                    generations_file.close()
+                if verifier_file is not None:
+                    verifier_file.close()
+                if eval_samples_file is not None:
+                    eval_samples_file.close()
 
     def train(self, *args, **kwargs):
         """Override train to save final checkpoint at end of training."""
@@ -503,6 +1276,26 @@ class Trainer(GRPOTrainer):
         gen_length = self.args.max_completion_length
         block_length = self.args.block_length
         temperature = self.args.temperature or 0.0
+        budget_choices = self.args.train_budget_sampling or [self.args.target_budget]
+        if self.args.enable_budget_conditioning:
+            target_budgets_for_policy = sample_group_target_budgets(
+                expanded_batch_size=prompt_ids.size(0),
+                num_generations=self.num_generations,
+                budget_choices=budget_choices,
+                device=device,
+            )
+        else:
+            target_budgets_for_policy = torch.full(
+                (prompt_ids.size(0),),
+                int(self.args.target_budget),
+                device=device,
+                dtype=torch.long,
+            )
+        rollout_compute_styles = assign_rollout_compute_styles(
+            expanded_batch_size=prompt_ids.size(0),
+            num_generations=self.num_generations,
+            styles=self.args.train_rollout_compute_styles,
+        )
 
         with unwrap_model_for_generation(
             self.model_wrapped, self.accelerator
@@ -512,6 +1305,7 @@ class Trainer(GRPOTrainer):
             num_steps_all = []
             remask_counts_all = []
             target_budgets_all = []
+            metadata_all = []
             force_es_thresholds = None
             if self.args.es_thresholds:
                 # TODO: For now we are hardcoding BL=32 for ES samples.
@@ -527,22 +1321,17 @@ class Trainer(GRPOTrainer):
                     end_idx = min(i + generation_batch_size, prompt_ids.size(0))
                     batch_prompt_ids = prompt_ids[i:end_idx]
                     batch_prompt_mask = prompt_mask[i:end_idx]
-                    batch_target_budget = None
-                    if self.args.enable_budget_conditioning:
-                        budget_choices = self.args.train_budget_sampling or [
-                            self.args.target_budget
-                        ]
-                        choice_idx = torch.randint(
-                            low=0,
-                            high=len(budget_choices),
-                            size=(batch_prompt_ids.size(0),),
-                            device=device,
-                        )
-                        batch_target_budget = torch.tensor(
-                            budget_choices,
-                            device=device,
-                            dtype=torch.long,
-                        )[choice_idx]
+                    batch_target_budget = target_budgets_for_policy[i:end_idx]
+                    batch_rollout_styles = rollout_compute_styles[i:end_idx]
+                    generation_target_budget = (
+                        batch_target_budget
+                        if self.args.enable_budget_conditioning
+                        else None
+                    )
+                    effective_hard_stop = (
+                        self.args.hard_stop_at_target_budget
+                        and generation_target_budget is not None
+                    )
 
                     result = generate_unified(
                         model=self.dllm,
@@ -560,7 +1349,10 @@ class Trainer(GRPOTrainer):
                         model_type=self.args.model_type,
                         attention_mask=batch_prompt_mask,
                         tokenizer=self.processing_class
-                        if self.args.enable_verifier
+                        if (
+                            self.args.enable_verifier
+                            or self.args.enable_posthoc_continuation
+                        )
                         else None,
                         enable_verifier=self.args.enable_verifier,
                         verifier_type=self.args.verifier_type,
@@ -573,9 +1365,67 @@ class Trainer(GRPOTrainer):
                         remask_cooldown_steps=self.args.remask_cooldown_steps,
                         min_steps_before_remask=self.args.min_steps_before_remask,
                         remask_answer_span_mode=self.args.remask_answer_span_mode,
-                        target_budget=batch_target_budget,
+                        target_budget=generation_target_budget,
+                        hard_stop_at_target_budget=effective_hard_stop,
+                        hard_generation_budget=self.args.hard_generation_budget,
                         policy_extra_feature_names=get_policy_extra_feature_names(
                             self.args
+                        ),
+                        log_step_traces=self.args.log_step_traces,
+                        rollout_compute_style=batch_rollout_styles,
+                        patient_unmask_logit_bias=self.args.patient_unmask_logit_bias,
+                        patient_policy_temperature=self.args.patient_policy_temperature,
+                        patient_max_unmask_fraction=(
+                            self.args.patient_max_unmask_fraction
+                        ),
+                        patient_min_steps_frac=self.args.patient_min_steps_frac,
+                        patient_global_slowdown=self.args.patient_global_slowdown,
+                        patient_delay_low_confidence=(
+                            self.args.patient_delay_low_confidence
+                        ),
+                        patient_low_confidence_quantile=(
+                            self.args.patient_low_confidence_quantile
+                        ),
+                        patient_delay_final_window=(
+                            self.args.patient_delay_final_window
+                        ),
+                        patient_final_window_tokens=(
+                            self.args.patient_final_window_tokens
+                        ),
+                        patient_final_window_min_steps_frac=(
+                            self.args.patient_final_window_min_steps_frac
+                        ),
+                        enable_deliberation_probe=self.args.enable_deliberation_probe,
+                        deliberation_probe_frac=self.args.deliberation_probe_frac,
+                        enable_posthoc_continuation=(
+                            self.args.enable_posthoc_continuation
+                        ),
+                        continuation_steps=list(self.args.continuation_steps),
+                        continuation_trigger=self.args.continuation_trigger,
+                        continuation_remask_mode=self.args.continuation_remask_mode,
+                        continuation_final_window_tokens=(
+                            self.args.continuation_final_window_tokens
+                        ),
+                        continuation_low_confidence_quantile=(
+                            self.args.continuation_low_confidence_quantile
+                        ),
+                        continuation_min_remaining_budget=(
+                            self.args.continuation_min_remaining_budget
+                        ),
+                        continuation_use_oracle_for_analysis=(
+                            self.args.continuation_use_oracle_for_analysis
+                        ),
+                        continuation_force_for_analysis=(
+                            self.args.continuation_force_for_analysis
+                        ),
+                        continuation_select_best_k_oracle=(
+                            self.args.continuation_select_best_k_oracle
+                        ),
+                        continuation_confidence_threshold=(
+                            self.args.continuation_confidence_threshold
+                        ),
+                        continuation_verifier_threshold=(
+                            self.args.continuation_verifier_threshold
                         ),
                     )
 
@@ -608,6 +1458,22 @@ class Trainer(GRPOTrainer):
                     num_steps_all.append(num_steps)
                     still_masked_all.append(still_masked)
                     prompt_completion_ids_all.append(batch_prompt_completion_ids)
+                    batch_metadata = result.metadata or []
+                    for local_idx, item in enumerate(batch_metadata):
+                        global_idx = i + local_idx
+                        item["target_budget"] = int(
+                            batch_target_budget[local_idx].item()
+                        )
+                        item["budget_error"] = item.get("nfe_used", 0) - item[
+                            "target_budget"
+                        ]
+                        item["group_id"] = global_idx // self.num_generations
+                        item["rollout_index"] = global_idx % self.num_generations
+                        item["rollout_compute_style"] = rollout_compute_styles[
+                            global_idx
+                        ]
+                        item["num_generations"] = self.num_generations
+                    metadata_all.extend(batch_metadata)
                     remask_counts_all.append(
                         torch.tensor(
                             [
@@ -618,17 +1484,7 @@ class Trainer(GRPOTrainer):
                             dtype=torch.long,
                         )
                     )
-                    if batch_target_budget is not None:
-                        target_budgets_all.append(batch_target_budget)
-                    else:
-                        target_budgets_all.append(
-                            torch.full(
-                                (batch_prompt_ids.size(0),),
-                                gen_length,
-                                device=device,
-                                dtype=torch.long,
-                            )
-                        )
+                    target_budgets_all.append(batch_target_budget)
                     # Removed gc.collect() and empty_cache() from inner loop for better GPU utilization
 
                 if force_es_thresholds is not None:
@@ -648,22 +1504,18 @@ class Trainer(GRPOTrainer):
                         )
                         .contiguous()
                     )
-                    es_target_budget = None
-                    if self.args.enable_budget_conditioning:
-                        budget_choices = self.args.train_budget_sampling or [
-                            self.args.target_budget
-                        ]
-                        choice_idx = torch.randint(
-                            low=0,
-                            high=len(budget_choices),
-                            size=(es_prompt_ids.size(0),),
-                            device=device,
-                        )
-                        es_target_budget = torch.tensor(
-                            budget_choices,
-                            device=device,
-                            dtype=torch.long,
-                        )[choice_idx]
+                    es_target_budget = target_budgets_for_policy[0].repeat(
+                        es_prompt_ids.size(0)
+                    )
+                    es_generation_target_budget = (
+                        es_target_budget
+                        if self.args.enable_budget_conditioning
+                        else None
+                    )
+                    es_effective_hard_stop = (
+                        self.args.hard_stop_at_target_budget
+                        and es_generation_target_budget is not None
+                    )
                     result = generate_unified(
                         model=self.dllm,
                         prompt=es_prompt_ids,
@@ -680,7 +1532,10 @@ class Trainer(GRPOTrainer):
                         model_type=self.args.model_type,
                         attention_mask=es_prompt_mask,
                         tokenizer=self.processing_class
-                        if self.args.enable_verifier
+                        if (
+                            self.args.enable_verifier
+                            or self.args.enable_posthoc_continuation
+                        )
                         else None,
                         enable_verifier=self.args.enable_verifier,
                         verifier_type=self.args.verifier_type,
@@ -693,9 +1548,61 @@ class Trainer(GRPOTrainer):
                         remask_cooldown_steps=self.args.remask_cooldown_steps,
                         min_steps_before_remask=self.args.min_steps_before_remask,
                         remask_answer_span_mode=self.args.remask_answer_span_mode,
-                        target_budget=es_target_budget,
+                        target_budget=es_generation_target_budget,
+                        hard_stop_at_target_budget=es_effective_hard_stop,
+                        hard_generation_budget=self.args.hard_generation_budget,
                         policy_extra_feature_names=get_policy_extra_feature_names(
                             self.args
+                        ),
+                        log_step_traces=self.args.log_step_traces,
+                        rollout_compute_style=["normal"] * es_prompt_ids.size(0),
+                        patient_global_slowdown=self.args.patient_global_slowdown,
+                        patient_delay_low_confidence=(
+                            self.args.patient_delay_low_confidence
+                        ),
+                        patient_low_confidence_quantile=(
+                            self.args.patient_low_confidence_quantile
+                        ),
+                        patient_delay_final_window=(
+                            self.args.patient_delay_final_window
+                        ),
+                        patient_final_window_tokens=(
+                            self.args.patient_final_window_tokens
+                        ),
+                        patient_final_window_min_steps_frac=(
+                            self.args.patient_final_window_min_steps_frac
+                        ),
+                        enable_deliberation_probe=self.args.enable_deliberation_probe,
+                        deliberation_probe_frac=self.args.deliberation_probe_frac,
+                        enable_posthoc_continuation=(
+                            self.args.enable_posthoc_continuation
+                        ),
+                        continuation_steps=list(self.args.continuation_steps),
+                        continuation_trigger=self.args.continuation_trigger,
+                        continuation_remask_mode=self.args.continuation_remask_mode,
+                        continuation_final_window_tokens=(
+                            self.args.continuation_final_window_tokens
+                        ),
+                        continuation_low_confidence_quantile=(
+                            self.args.continuation_low_confidence_quantile
+                        ),
+                        continuation_min_remaining_budget=(
+                            self.args.continuation_min_remaining_budget
+                        ),
+                        continuation_use_oracle_for_analysis=(
+                            self.args.continuation_use_oracle_for_analysis
+                        ),
+                        continuation_force_for_analysis=(
+                            self.args.continuation_force_for_analysis
+                        ),
+                        continuation_select_best_k_oracle=(
+                            self.args.continuation_select_best_k_oracle
+                        ),
+                        continuation_confidence_threshold=(
+                            self.args.continuation_confidence_threshold
+                        ),
+                        continuation_verifier_threshold=(
+                            self.args.continuation_verifier_threshold
                         ),
                     )
 
@@ -727,6 +1634,18 @@ class Trainer(GRPOTrainer):
                     )
                     num_steps_all.append(es_num_steps)
                     prompt_completion_ids_all.append(es_prompt_completion_ids)
+                    es_metadata = result.metadata or []
+                    for local_idx, item in enumerate(es_metadata):
+                        item["target_budget"] = int(es_target_budget[local_idx].item())
+                        item["budget_error"] = item.get("nfe_used", 0) - item[
+                            "target_budget"
+                        ]
+                        item["group_id"] = 0
+                        item["rollout_index"] = self.num_generations + local_idx
+                        item["rollout_compute_style"] = "expert_steering"
+                        item["num_generations"] = self.num_generations
+                        item["expert_steering"] = True
+                    metadata_all.extend(es_metadata)
                     remask_counts_all.append(
                         torch.tensor(
                             [
@@ -737,17 +1656,7 @@ class Trainer(GRPOTrainer):
                             dtype=torch.long,
                         )
                     )
-                    if es_target_budget is not None:
-                        target_budgets_all.append(es_target_budget)
-                    else:
-                        target_budgets_all.append(
-                            torch.full(
-                                (es_prompt_ids.size(0),),
-                                gen_length,
-                                device=device,
-                                dtype=torch.long,
-                            )
-                        )
+                    target_budgets_all.append(es_target_budget)
                     # Removed gc.collect() and empty_cache() from inner loop for better GPU utilization
 
                 prompt_completion_ids = torch.cat(prompt_completion_ids_all, dim=0)
@@ -802,6 +1711,7 @@ class Trainer(GRPOTrainer):
         rewards_per_func = torch.zeros(
             len(prompts), len(self.reward_funcs), device=device
         )
+        effective_reward_budget_mode = _effective_reward_budget_mode(self.args)
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
@@ -841,9 +1751,77 @@ class Trainer(GRPOTrainer):
                     target_budget=target_budgets,
                     reward_lambda_compute=self.args.reward_lambda_compute,
                     reward_normalize_compute=self.args.reward_normalize_compute,
+                    reward_gsm_extractor=self.args.reward_gsm_extractor,
                     reward_beta=self.args.reward_beta,
                     reward_mu=self.args.reward_mu,
                     reward_rho=self.args.reward_rho,
+                    reward_quality_mode=self.args.reward_quality_mode,
+                    answer_span_partial_credit=self.args.answer_span_partial_credit,
+                    malformed_answer_factor=self.args.malformed_answer_factor,
+                    source_answer_marker_credit=self.args.source_answer_marker_credit,
+                    source_final_line_credit=self.args.source_final_line_credit,
+                    source_final_window_credit=self.args.source_final_window_credit,
+                    source_incomplete_answer_tag_credit=(
+                        self.args.source_incomplete_answer_tag_credit
+                    ),
+                    source_other_answer_span_credit=(
+                        self.args.source_other_answer_span_credit
+                    ),
+                    enable_repetition_penalty=self.args.enable_repetition_penalty,
+                    repetition_min_tokens=self.args.repetition_min_tokens,
+                    repetition_number_run_threshold=(
+                        self.args.repetition_number_run_threshold
+                    ),
+                    repetition_token_run_threshold=(
+                        self.args.repetition_token_run_threshold
+                    ),
+                    repetition_bigram_run_threshold=(
+                        self.args.repetition_bigram_run_threshold
+                    ),
+                    repetition_answer_span_number_threshold=(
+                        self.args.repetition_answer_span_number_threshold
+                    ),
+                    repetition_unique_ratio_threshold=(
+                        self.args.repetition_unique_ratio_threshold
+                    ),
+                    repetition_max_freq_threshold=(
+                        self.args.repetition_max_freq_threshold
+                    ),
+                    repetition_penalty_factor=self.args.repetition_penalty_factor,
+                    zero_reward_if_repeated_answer_span=(
+                        self.args.zero_reward_if_repeated_answer_span
+                    ),
+                    max_reward_if_malformed=self.args.max_reward_if_malformed,
+                    max_reward_if_repetitive=self.args.max_reward_if_repetitive,
+                    reward_budget_mode=effective_reward_budget_mode,
+                    reward_type=self.args.reward_type,
+                    threshold_reward_hard_zero=self.args.threshold_reward_hard_zero,
+                    enable_negative_junk_penalty=(
+                        self.args.enable_negative_junk_penalty
+                    ),
+                    repeated_junk_negative_reward=(
+                        self.args.repeated_junk_negative_reward
+                    ),
+                    malformed_junk_negative_reward=(
+                        self.args.malformed_junk_negative_reward
+                    ),
+                    incomplete_answer_tag_negative_reward=(
+                        self.args.incomplete_answer_tag_negative_reward
+                    ),
+                    min_reward_floor=self.args.min_reward_floor,
+                    format_ok=[item.get("format_ok") for item in metadata_all],
+                    early_generated_text=[
+                        item.get("early_generated_text") for item in metadata_all
+                    ],
+                    rollout_compute_style=[
+                        item.get("rollout_compute_style", "normal")
+                        for item in metadata_all
+                    ],
+                    num_generations=self.num_generations,
+                    enable_deliberation_probe=self.args.enable_deliberation_probe,
+                    deliberation_bonus_weight=self.args.deliberation_bonus_weight,
+                    patient_win_bonus=self.args.patient_win_bonus,
+                    patient_win_margin=self.args.patient_win_margin,
                     remask_count=remask_counts,
                     **reward_kwargs,
                 )
@@ -881,6 +1859,11 @@ class Trainer(GRPOTrainer):
                 output_reward_func, dtype=torch.float32, device=device
             )
 
+        local_rewards_per_func = rewards_per_func.detach().clone()
+        local_rewards = (
+            local_rewards_per_func * self.reward_weights.to(device).unsqueeze(0)
+        ).nansum(dim=1)
+
         # If all reward functions return None for a given row, issue a detailed warning
         if torch.isnan(rewards_per_func).all(dim=1).any():
             nan_row_idx = (
@@ -896,6 +1879,17 @@ class Trainer(GRPOTrainer):
                 "Please ensure that at least one reward function returns a valid reward."
             )
 
+        mode = "eval" if self.control.should_evaluate else "train"
+        self._write_generation_records(
+            mode=mode,
+            inputs=inputs,
+            prompts_text=prompts_text,
+            completions_text=completions_text,
+            metadata=metadata_all,
+            rewards=local_rewards,
+            rewards_per_func=local_rewards_per_func,
+        )
+
         rewards_per_func = gather(rewards_per_func)
         rewards = (
             rewards_per_func * self.reward_weights.to(device).unsqueeze(0)
@@ -903,31 +1897,38 @@ class Trainer(GRPOTrainer):
 
         # Compute grouped-wise rewards
         group_size = self.num_generations + len(self.args.es_thresholds or [])
-        mean_grouped_rewards = rewards.view(-1, group_size).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, group_size).std(dim=1)
+        grouped_rewards = rewards.view(-1, group_size)
+        mean_grouped_rewards_raw = grouped_rewards.mean(dim=1)
+        std_grouped_rewards_raw = grouped_rewards.std(dim=1, unbiased=False)
+        zero_reward_groups = (grouped_rewards.abs().amax(dim=1) <= 1e-8)
+        mixed_reward_groups = (grouped_rewards.amin(dim=1) <= 1e-8) & (
+            grouped_rewards.amax(dim=1) > 1e-8
+        )
 
         # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(group_size, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(group_size, dim=0)
+        mean_grouped_rewards = mean_grouped_rewards_raw.repeat_interleave(
+            group_size,
+            dim=0,
+        )
+        std_grouped_rewards = std_grouped_rewards_raw.repeat_interleave(
+            group_size,
+            dim=0,
+        )
         advantages = rewards - mean_grouped_rewards
         # Count prompts with zero std deviation (policy only for metrics)
-        zero_std_count = (std_grouped_rewards < 1e-6).sum().item()
-        total_prompts = std_grouped_rewards.size(0)
+        zero_std_count = (std_grouped_rewards_raw < 1e-6).sum().item()
+        total_prompts = std_grouped_rewards_raw.size(0)
         zero_std_ratio = zero_std_count / total_prompts if total_prompts > 0 else 0.0
 
-        # Slice out this process's advantages
-        # Each process has per_device_train_batch_size items (potentially multiple groups)
-        items_per_process = self.args.per_device_train_batch_size + (
-            len(self.args.es_thresholds) if self.args.es_thresholds else 0
-        )
+        # Slice out this process's advantages. TRL can pass already-expanded
+        # GRPO samples here, so use the actual local sample count instead of
+        # assuming it equals per_device_train_batch_size.
+        items_per_process = len(prompts)
         process_slice = slice(
             self.accelerator.process_index * items_per_process,
             (self.accelerator.process_index + 1) * items_per_process,
         )
         advantages = advantages[process_slice]
-
-        # Log the metrics
-        mode = "eval" if self.control.should_evaluate else "train"
 
         completion_length = self.accelerator.gather_for_metrics(
             completion_mask.sum(1)
@@ -959,9 +1960,37 @@ class Trainer(GRPOTrainer):
         self._metrics[mode]["zero_std_ratio"].append(zero_std_ratio)
         self._metrics[mode]["effective_steps"].append(self.effective_steps)
 
-        still_masked = gather(still_masked)  # (N_GPUs * G,)
-        still_masked = (still_masked.float() / gen_length).mean()
-        self._metrics[mode]["still_masked"].append(still_masked.item())
+        still_masked_metric = gather(still_masked).float()
+        self._metrics[mode]["still_masked_sample_rate"].append(
+            still_masked_metric.mean().item()
+        )
+        policy_metadata_for_metrics = metadata_all[: still_masked.numel()]
+        masked_token_counts = torch.tensor(
+            [
+                item.get("masked_token_count", 0)
+                for item in policy_metadata_for_metrics
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        masked_token_fractions = torch.tensor(
+            [
+                item.get("masked_token_fraction", 0.0)
+                for item in policy_metadata_for_metrics
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        masked_token_counts = self.accelerator.gather_for_metrics(masked_token_counts)
+        masked_token_fractions = self.accelerator.gather_for_metrics(
+            masked_token_fractions
+        )
+        self._metrics[mode]["masked_token_count_mean"].append(
+            masked_token_counts.mean().item()
+        )
+        self._metrics[mode]["masked_token_fraction_mean"].append(
+            masked_token_fractions.mean().item()
+        )
 
         # Metrics: Calculate mean reward per function, but only for samples where the function was applied
         # and the sample actually came from the policy (not ES)
@@ -979,7 +2008,73 @@ class Trainer(GRPOTrainer):
 
         rewards_policy = rewards[post_gathering_policy_only_index]
         self._metrics[mode]["reward"].append(rewards_policy.mean().item())
-        self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+        self._metrics[mode]["reward_std"].append(std_grouped_rewards_raw.mean().item())
+        self._metrics[mode]["reward_max"].append(rewards_policy.max().item())
+        raw_task_score_values = []
+        budget_multiplier_values = []
+        for idx, example in enumerate(inputs):
+            item_metadata = metadata_all[idx] if idx < len(metadata_all) else {}
+            generated_text = (
+                completions_text[idx]
+                if idx < len(completions_text)
+                else item_metadata.get("generated_text_final")
+            )
+            if example.get("dataset_type", self.args.dataset) == "gsm8k":
+                fields = _gsm_reward_parse_fields(
+                    generated_text,
+                    example.get("answer"),
+                    self.args,
+                    item_metadata,
+                )
+                raw_task_score_values.append(float(fields["raw_task_score"]))
+                budget_multiplier_values.append(float(fields["budget_multiplier"]))
+            else:
+                raw_task_score_values.append(float("nan"))
+                budget_multiplier_values.append(float("nan"))
+        raw_task_scores_metric = self.accelerator.gather_for_metrics(
+            torch.tensor(raw_task_score_values, device=device, dtype=torch.float32)
+        )[post_gathering_policy_only_index]
+        budget_multipliers_metric = self.accelerator.gather_for_metrics(
+            torch.tensor(budget_multiplier_values, device=device, dtype=torch.float32)
+        )[post_gathering_policy_only_index]
+        finite_raw_task_scores = raw_task_scores_metric[
+            torch.isfinite(raw_task_scores_metric)
+        ]
+        if finite_raw_task_scores.numel() > 0:
+            self._metrics[mode]["raw_task_score_mean"].append(
+                finite_raw_task_scores.mean().item()
+            )
+            self._metrics[mode]["raw_task_score_max"].append(
+                finite_raw_task_scores.max().item()
+            )
+        finite_budget_multipliers = budget_multipliers_metric[
+            torch.isfinite(budget_multipliers_metric)
+        ]
+        if finite_budget_multipliers.numel() > 0:
+            self._metrics[mode]["budget_multiplier_mean"].append(
+                finite_budget_multipliers.mean().item()
+            )
+            self._metrics[mode]["budget_multiplier_min"].append(
+                finite_budget_multipliers.min().item()
+            )
+            self._metrics[mode]["budget_factor_mean"].append(
+                finite_budget_multipliers.mean().item()
+            )
+        self._metrics[mode]["positive_reward_rate"].append(
+            (rewards_policy > 1e-8).float().mean().item()
+        )
+        self._metrics[mode]["group_reward_mean"].append(
+            mean_grouped_rewards_raw.mean().item()
+        )
+        self._metrics[mode]["group_reward_std"].append(
+            std_grouped_rewards_raw.mean().item()
+        )
+        self._metrics[mode]["zero_reward_group_rate"].append(
+            zero_reward_groups.float().mean().item()
+        )
+        self._metrics[mode]["mixed_reward_group_rate"].append(
+            mixed_reward_groups.float().mean().item()
+        )
         target_budgets_metric = self.accelerator.gather_for_metrics(
             target_budgets
         ).float()
@@ -994,11 +2089,26 @@ class Trainer(GRPOTrainer):
         self._metrics[mode]["budget_error_abs_mean"].append(
             budget_error.abs().mean().item()
         )
+        for budget_value in sorted(set(int(v.item()) for v in target_budgets_policy)):
+            budget_mask = target_budgets_policy == budget_value
+            if budget_mask.any():
+                self._metrics[mode][
+                    f"avg_nfe_by_target_budget/{budget_value}"
+                ].append(num_steps_budget_policy[budget_mask].mean().item())
         self._metrics[mode]["reward_type/multiplicative_budget"].append(
             float(self.args.reward_type == "multiplicative_budget")
         )
         self._metrics[mode]["reward_type/additive_proposal"].append(
             float(self.args.reward_type == "additive_proposal")
+        )
+        self._metrics[mode]["reward_type/task_only"].append(
+            float(self.args.reward_type == "task_only")
+        )
+        self._metrics[mode]["budget_is_hard_cap"].append(
+            float(
+                self.args.enable_budget_conditioning
+                and self.args.hard_stop_at_target_budget
+            )
         )
 
         # Log ES advantages if present

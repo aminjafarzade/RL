@@ -3,6 +3,11 @@
 # Copyright (C) 2026 Apple Inc. All Rights Reserved.
 #
 ### Adapted from https://github.com/dllm-reasoning/d1 (Apache 2.0)
+from common.cuda_env import set_cuda_visible_devices_from_argv
+
+
+set_cuda_visible_devices_from_argv()
+
 import argparse
 import json
 import math
@@ -646,6 +651,31 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config", type=str, required=True, help="Path to experiment config file"
     )
+    parser.add_argument(
+        "--gpu",
+        type=str,
+        default=None,
+        help=(
+            "Physical GPU index/list to expose before torch initializes. "
+            "Example: --gpu 2 makes physical GPU 2 visible as cuda:0."
+        ),
+    )
+    parser.add_argument(
+        "--cuda_visible_devices",
+        "--cuda-visible-devices",
+        dest="cuda_visible_devices",
+        type=str,
+        default=None,
+        help="Direct CUDA_VISIBLE_DEVICES value, e.g. '2' or '0,1'.",
+    )
+    parser.add_argument(
+        "--cuda_min_memory_gb",
+        "--cuda-min-memory-gb",
+        dest="cuda_min_memory_gb",
+        type=float,
+        default=None,
+        help="Auto-select the smallest GPU with at least this much total memory.",
+    )
     parser.add_argument("--model_path", type=str, required=False, default=None)
     parser.add_argument(
         "--few_shot",
@@ -756,6 +786,17 @@ if __name__ == "__main__":
 
     # NOTE: setting up the accelerator must be done after parsing config
     accelerator = Accelerator()
+    if accelerator.is_main_process:
+        if torch.cuda.is_available():
+            current_device = torch.cuda.current_device()
+            print(
+                "CUDA_VISIBLE_DEVICES="
+                f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<all>')}; "
+                f"using process cuda:{current_device} "
+                f"({torch.cuda.get_device_name(current_device)})"
+            )
+        else:
+            print("CUDA is not available; using CPU.")
 
     # Check if we are running a baseline, if so get the args from the name
     args.baseline_mode = baseline_mode
