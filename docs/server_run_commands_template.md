@@ -7,7 +7,7 @@ Do not run these locally during implementation. Run them later on the GPU server
 ## 0. Environment check
 
 ```bash
-cd /path/to/ml-rl-dllm
+cd /path/to/RL
 nvidia-smi
 python --version
 pip list | grep -E "torch|transformers|accelerate|datasets"

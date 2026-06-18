@@ -7,14 +7,14 @@ Unzip this bundle at the **root of the RL unmasking-policy repository**, prefera
 Example:
 
 ```bash
-cd /path/to/ml-rl-dllm
+cd /path/to/RL
 unzip /path/to/codex_llada_context_bundle.zip
 ```
 
 After unzipping, the repo should look like:
 
 ```text
-/path/to/ml-rl-dllm/
+/path/to/RL/
   AGENTS.md
   docs/
     README_context_bundle.md
